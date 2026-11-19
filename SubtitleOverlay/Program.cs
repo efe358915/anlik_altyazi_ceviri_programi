@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Windows.Forms;
@@ -10,6 +10,7 @@ namespace OyunCeviriAraci
         [STAThread]
         static void Main()
         {
+            Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new Form1());
@@ -21,14 +22,18 @@ namespace OyunCeviriAraci
 
         public Form1()
         {
-            // 1. Tam Ekran Şeffaf Katman Ayarları
-            this.FormBorderStyle = FormBorderStyle.None; // Kenarlıkları kaldır
-            this.WindowState = FormWindowState.Maximized; // Tam ekran yap
-            this.TopMost = true; // Her şeyin en üstünde tut
-            this.BackColor = Color.Black; // Arka planı siyah yap
-            this.Opacity = 0.35; // %35 şeffaflık (Ekranı hafif karartır)
-            this.Cursor = Cursors.Cross; // Fare imlecini artı (+) yap
-            this.DoubleBuffered = true; // Çizim yaparken ekranın titremesini önler
+            // Sanal masaüstünü (tum monitörleri ve negatif koordinatları) kapsar.
+            Rectangle sanalMasaustu = GetSanalMasaustu();
+
+            this.FormBorderStyle = FormBorderStyle.None;
+            this.StartPosition = FormStartPosition.Manual;
+            this.Bounds = sanalMasaustu;
+            this.TopMost = true;
+            this.BackColor = Color.Black;
+            this.Opacity = 0.35;
+            this.Cursor = Cursors.Cross;
+            this.DoubleBuffered = true;
+            this.AutoScaleMode = AutoScaleMode.Dpi;
 
             // 2. Fare ve Klavye Olaylarını Bağlama
             this.MouseDown += Ekran_MouseDown;
@@ -38,6 +43,24 @@ namespace OyunCeviriAraci
             this.KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape) this.Close(); }; // ESC ile çıkış
         }
 
+        private static Rectangle GetSanalMasaustu()
+        {
+            int sol = 0;
+            int ust = 0;
+            int sag = 0;
+            int alt = 0;
+
+            foreach (Screen ekran in Screen.AllScreens)
+            {
+                sol = Math.Min(sol, ekran.Bounds.Left);
+                ust = Math.Min(ust, ekran.Bounds.Top);
+                sag = Math.Max(sag, ekran.Bounds.Right);
+                alt = Math.Max(alt, ekran.Bounds.Bottom);
+            }
+
+            return Rectangle.FromLTRB(sol, ust, sag, alt);
+        }
+
         // Tıklama Anı (X1, Y1)
         private void Ekran_MouseDown(object? sender, MouseEventArgs e)
         {
@@ -45,6 +68,8 @@ namespace OyunCeviriAraci
             {
                 cizimYapiliyor = true;
                 baslangicNoktasi = e.Location;
+                secilenAlan = new Rectangle(e.Location, Size.Empty);
+                this.Invalidate();
             }
         }
 
@@ -88,6 +113,15 @@ namespace OyunCeviriAraci
             if (cizimYapiliyor)
             {
                 cizimYapiliyor = false;
+
+                int x = Math.Min(baslangicNoktasi.X, e.X);
+                int y = Math.Min(baslangicNoktasi.Y, e.Y);
+                secilenAlan = new Rectangle(
+                    x,
+                    y,
+                    Math.Abs(baslangicNoktasi.X - e.X),
+                    Math.Abs(baslangicNoktasi.Y - e.Y));
+
                 this.Hide(); // Şeffaf katmanı gizle ki yakalanan resim kararmasın
 
                 // Çok küçük (yanlışlıkla) tıklamaları yoksay
@@ -103,18 +137,27 @@ namespace OyunCeviriAraci
         // 3. Piksel Verisini Kırpma (Screen Capture)
         private void BolgeyiYakala(Rectangle bolge)
         {
+            Point solUst = this.PointToScreen(bolge.Location);
+            Point sagAlt = this.PointToScreen(
+                new Point(bolge.Right, bolge.Bottom));
+            Rectangle ekranBolgesi = Rectangle.FromLTRB(
+                Math.Min(solUst.X, sagAlt.X),
+                Math.Min(solUst.Y, sagAlt.Y),
+                Math.Max(solUst.X, sagAlt.X),
+                Math.Max(solUst.Y, sagAlt.Y));
+
             // Seçilen boyutlarda boş bir resim (Bitmap) oluştur
-            using (Bitmap yakalananResim = new Bitmap(bolge.Width, bolge.Height))
+            using (Bitmap yakalananResim = new Bitmap(ekranBolgesi.Width, ekranBolgesi.Height))
             {
                 using (Graphics g = Graphics.FromImage(yakalananResim))
                 {
                     // Ekran kartından doğrudan ilgili koordinatları belleğe kopyala
-                    g.CopyFromScreen(bolge.Location, Point.Empty, bolge.Size);
+                    g.CopyFromScreen(ekranBolgesi.Location, Point.Empty, ekranBolgesi.Size);
                 }
 
                 // Test amaçlı bilgisayara kaydet (Asıl programda RAM'den direkt OCR'a gidecek)
                 yakalananResim.Save("secilen_altyazi_bolgesi.png", ImageFormat.Png);
-                MessageBox.Show($"Bölge yakalandı!\nKoordinatlar: {bolge}", "Başarılı");
+                MessageBox.Show($"Bölge yakalandı!\nKoordinatlar: {ekranBolgesi}", "Başarılı");
             }
         }
     }
