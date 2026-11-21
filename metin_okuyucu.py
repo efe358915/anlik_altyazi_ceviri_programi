@@ -25,7 +25,13 @@ BOLGE_DOSYASI = (
     / "SubtitleOverlay" / "bin" / "Debug" / "net11.0-windows" / "bolge.json"
 )
 POLL_ARALIGI = 0.05        # sn. 0.05 = saniyede 20 kontrol
-YAZI_ESIGI = 200           # Bu parlaklıktan açık pikseller "yazı" sayılır (beyaz yazı için)
+YAZI_ESIGI = 200           # Bu parlaklıktan açık pikseller "harf adayı" sayılır (beyaz yazı için)
+GEVSEK_ESIGI = 150         # Harfin yanındaki noktalama/ince kenarlar için daha düşük eşik
+KOYU_ESIGI = 110           # Harfin çevresindeki "koyu" sayılacak parlaklık sınırı
+KOYU_ORAN = 0.6            # Harf çevresinin en az bu kadarı koyu olmalı (kutu/kontur/gölge)
+MIN_BILESEN = 2            # En az bu kadar harf benzeri parça yoksa bölge "altyazı yok" sayılır
+MAX_BILESEN = 150          # Bundan fazla parlak parça = gürültülü sahne, altyazı değil
+MIN_HARF_YUK = 6           # Harf adayının en az piksel yüksekliği
 DEGISIM_ESIGI = 25         # Maskede bu kadar piksel değişirse "değişti" say
 MIN_YAZI_PIKSELI = 25      # Bundan az yazı pikseli varsa bölge boş sayılır
 EN_FAZLA_BEKLEME = 0.4     # sn. Yazı oturmasa bile en fazla bu kadar bekle
@@ -53,11 +59,58 @@ def bolge_oku():
     return {"left": b["x"], "top": b["y"], "width": b["w"], "height": b["h"]}
 
 
+_K7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+_KYAKIN = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 9))
+
+
 def yazi_maskesi(bgra):
-    """Parlak pikselleri 255, gerisini 0 yapar. Arka plan hareketini eler."""
+    """Sadece "altyazı harfine benzeyen" parlak parçaları tutar, gerisini siler.
+
+    Harf = parlak + makul boyutta + çevresi koyu (altyazı kutusu / kontur / gölge).
+    Kar, ışık, patlama, parlak gökyüzü gibi büyük veya çevresi koyu olmayan parlak
+    bölgeler elenir; böylece hareketli sahnede yazı yokken OCR'a anlamsız görüntü gitmez.
+    Altyazı yoksa tamamen siyah (boş) maske döner.
+    """
     gri = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
-    _, maske = cv2.threshold(gri, YAZI_ESIGI, 255, cv2.THRESH_BINARY)
-    return maske
+    _, parlak = cv2.threshold(gri, YAZI_ESIGI, 255, cv2.THRESH_BINARY)
+    bos = np.zeros_like(parlak)
+    if cv2.countNonZero(parlak) < MIN_YAZI_PIKSELI:
+        return bos
+
+    n, etiket, stat, _ = cv2.connectedComponentsWithStats(parlak, connectivity=8)
+    if n > MAX_BILESEN:
+        return bos
+
+    yuk, gen = gri.shape
+    w = stat[:, cv2.CC_STAT_WIDTH]
+    h = stat[:, cv2.CC_STAT_HEIGHT]
+    alan = stat[:, cv2.CC_STAT_AREA]
+    uygun = (h >= MIN_HARF_YUK) & (w <= 0.5 * gen) & (alan >= 6) & (alan <= 0.05 * yuk * gen)
+    uygun[0] = False  # 0 = arka plan
+
+    temiz = bos.copy()
+    gecen = 0
+    for i in np.flatnonzero(uygun):
+        x, y, bw, bh = stat[i, 0], stat[i, 1], stat[i, 2], stat[i, 3]
+        y0, y1 = max(0, y - 4), min(yuk, y + bh + 4)
+        x0, x1 = max(0, x - 4), min(gen, x + bw + 4)
+        kendi = (etiket[y0:y1, x0:x1] == i).astype(np.uint8)
+        # Harfin çevresindeki halka (komşu parlak pikseller hariç) koyu mu?
+        halka = (cv2.dilate(kendi, _K7) > 0) & (parlak[y0:y1, x0:x1] == 0)
+        if not halka.any():
+            continue
+        if (gri[y0:y1, x0:x1][halka] < KOYU_ESIGI).mean() < KOYU_ORAN:
+            continue
+        temiz[y0:y1, x0:x1][kendi > 0] = 255
+        gecen += 1
+
+    if gecen < MIN_BILESEN:
+        return bos
+
+    # Harflerin hemen yanındaki noktalama (. , ' !) ve ince kenarları geri kat
+    yakin = cv2.dilate(temiz, _KYAKIN)
+    _, gevsek = cv2.threshold(gri, GEVSEK_ESIGI, 255, cv2.THRESH_BINARY)
+    return cv2.bitwise_and(gevsek, yakin)
 
 
 def ocr_icin_hazirla(maske):
@@ -110,7 +163,7 @@ def main():
 
     print(f"[BİLGİ] Bölge: {bolge} | Tesseract: {'var' if tesseract_var else 'yok'} | Çıkış: Ctrl+C")
 
-    sct = mss.mss()
+    sct = mss.MSS() if hasattr(mss, "MSS") else mss.mss()
     onceki = None      # bir önceki karenin maskesi
     okunan = None      # en son OCR'a giden maske
     ilk_degisim = None # değişimi ilk fark ettiğimiz an
