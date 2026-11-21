@@ -1,6 +1,5 @@
 using System;
 using System.Drawing;
-using System.Drawing.Imaging;
 using System.Windows.Forms;
 
 namespace OyunCeviriAraci
@@ -146,19 +145,9 @@ namespace OyunCeviriAraci
                 Math.Max(solUst.X, sagAlt.X),
                 Math.Max(solUst.Y, sagAlt.Y));
 
-            // Seçilen boyutlarda boş bir resim (Bitmap) oluştur
-            using (Bitmap yakalananResim = new Bitmap(ekranBolgesi.Width, ekranBolgesi.Height))
-            {
-                using (Graphics g = Graphics.FromImage(yakalananResim))
-                {
-                    // Ekran kartından doğrudan ilgili koordinatları belleğe kopyala
-                    g.CopyFromScreen(ekranBolgesi.Location, Point.Empty, ekranBolgesi.Size);
-                }
-
-                // Test amaçlı bilgisayara kaydet (Asıl programda RAM'den direkt OCR'a gidecek)
-                yakalananResim.Save("secilen_altyazi_bolgesi.png", ImageFormat.Png);
-                MessageBox.Show($"Bölge yakalandı!\nKoordinatlar: {ekranBolgesi}", "Başarılı");
-            }
+            string json = $"{{\"x\":{ekranBolgesi.X},\"y\":{ekranBolgesi.Y},\"w\":{ekranBolgesi.Width},\"h\":{ekranBolgesi.Height}}}";
+            File.WriteAllText("bolge.json", json);
+            MessageBox.Show($"Bölge yakalandı!\nKoordinatlar: {ekranBolgesi}", "Başarılı");
         }
     }
 }
