@@ -1,9 +1,35 @@
+"""
+Aşama 2: RAM'den okuma + değişim algılama + gecikme ölçümü.
+
+C# aracı artık PNG yerine bolge.json (x, y, w, h) yazar.
+Ekran görüntüsünü bu süreç kendisi alır (dosya yok, süreçler arası piksel aktarımı yok).
+
+Gerekli paketler:
+    pip install mss numpy rapidocr_onnxruntime pytesseract
+(opencv, rapidocr_onnxruntime ile zaten gelir)
+"""
+import json
+import shutil
 import time
 from pathlib import Path
-import shutil
-from PIL import Image
-from rapidocr_onnxruntime import RapidOCR
+
+import cv2
+import mss
+import numpy as np
 import pytesseract
+from rapidocr_onnxruntime import RapidOCR
+
+# ---------------- Ayarlar ----------------
+BOLGE_DOSYASI = (
+    Path(__file__).resolve().parent
+    / "SubtitleOverlay" / "bin" / "Debug" / "net11.0-windows" / "bolge.json"
+)
+POLL_ARALIGI = 0.05        # sn. 0.05 = saniyede 20 kontrol
+YAZI_ESIGI = 200           # Bu parlaklıktan açık pikseller "yazı" sayılır (beyaz yazı için)
+DEGISIM_ESIGI = 25         # Maskede bu kadar piksel değişirse "değişti" say
+MIN_YAZI_PIKSELI = 25      # Bundan az yazı pikseli varsa bölge boş sayılır
+EN_FAZLA_BEKLEME = 0.4     # sn. Yazı oturmasa bile en fazla bu kadar bekle
+TEK_SATIR = False          # Altyazılar hep tek satırsa True yap (daha hızlı)
 
 
 def tesseract_bul():
@@ -20,93 +46,133 @@ def tesseract_bul():
             return str(yol)
     return None
 
-def altyazi_oku():
-    # 1. Adım: Dosyanın Varlığını ve Yolunu Kontrol Etmek
-    gorsel_yolu = (
-    Path(__file__).resolve().parent
-    / "SubtitleOverlay" / "bin" / "Debug" / "net11.0-windows"
-    / "secilen_altyazi_bolgesi.png"
-)
-    
-    if not gorsel_yolu.exists():
-        print(f"[HATA] '{gorsel_yolu}' bulunamadı! Önce C# aracıyla ekran bölgesini seçin.")
+
+def bolge_oku():
+    with open(BOLGE_DOSYASI, encoding="utf-8") as f:
+        b = json.load(f)
+    return {"left": b["x"], "top": b["y"], "width": b["w"], "height": b["h"]}
+
+
+def yazi_maskesi(bgra):
+    """Parlak pikselleri 255, gerisini 0 yapar. Arka plan hareketini eler."""
+    gri = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
+    _, maske = cv2.threshold(gri, YAZI_ESIGI, 255, cv2.THRESH_BINARY)
+    return maske
+
+
+def ocr_icin_hazirla(maske):
+    ters = cv2.bitwise_not(maske)  # beyaz zemin, siyah yazı (OCR motorları sever)
+    buyuk = cv2.resize(ters, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    return cv2.copyMakeBorder(buyuk, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
+
+
+def ocr_yap(hazir, tesseract_var, rapid):
+    """(metin, tesseract_ms, rapid_ms) döndürür."""
+    metin, t_ms, r_ms = "", 0.0, 0.0
+
+    if tesseract_var:
+        t0 = time.perf_counter()
+        ham = pytesseract.image_to_string(
+            hazir,
+            lang="eng",
+            config=f"--psm {'7' if TEK_SATIR else '6'}",
+        )
+        t_ms = (time.perf_counter() - t0) * 1000
+        metin = " ".join(ham.split())
+
+    if not metin:
+        t0 = time.perf_counter()
+        sonuc, _ = rapid(cv2.cvtColor(hazir, cv2.COLOR_GRAY2BGR))
+        r_ms = (time.perf_counter() - t0) * 1000
+        if sonuc:
+            metin = " ".join(s[1].strip() for s in sonuc).strip()
+
+    return metin, t_ms, r_ms
+
+
+def main():
+    try:
+        bolge = bolge_oku()
+    except FileNotFoundError:
+        print(f"[HATA] '{BOLGE_DOSYASI}' bulunamadı! Önce C# aracıyla ekran bölgesini seçin.")
         return
 
-    print("[BİLGİ] Görsel bulundu, OCR motoru hazırlanıyor...")
-    
-    # Tek satırlık altyazılar için Tesseract daha iyi noktalama tanır.
-    # RapidOCR Tesseract kurulu değilse veya metin döndürmezse yedektir.
     tesseract_yolu = tesseract_bul()
-    ocr_motoru = RapidOCR(use_text_det=False)
     if tesseract_yolu:
         pytesseract.pytesseract.tesseract_cmd = tesseract_yolu
+    tesseract_var = bool(tesseract_yolu)
 
-    # Süre ölçümünü başlat
-    baslangic_zamani = time.perf_counter()
-    goruntu_yukleme_baslangici = baslangic_zamani
+    # Modeller BİR KEZ yüklenir (döngü içinde değil)
+    rapid = RapidOCR(use_text_det=not TEK_SATIR)
 
-    # 2. Adım: Görseli Belleğe Almak (with bloğu ile dosya kilitlenmesini önleyerek)
+    # Isınma turu: ilk gerçek OCR çağrısı yavaş olmasın
+    ocr_yap(np.full((40, 200), 255, dtype=np.uint8), tesseract_var, rapid)
+
+    print(f"[BİLGİ] Bölge: {bolge} | Tesseract: {'var' if tesseract_var else 'yok'} | Çıkış: Ctrl+C")
+
+    sct = mss.mss()
+    onceki = None      # bir önceki karenin maskesi
+    okunan = None      # en son OCR'a giden maske
+    ilk_degisim = None # değişimi ilk fark ettiğimiz an
+    son_metin = None
+
     try:
-        with Image.open(gorsel_yolu) as img:
-            goruntu_yukleme_suresi = (time.perf_counter() - goruntu_yukleme_baslangici) * 1000
-            # 3. Adım: Ön İşleme (İlk testte görseli ham haliyle RGB'ye çevirip veriyoruz)
-            ham_gorsel = img.convert("RGB")
+        while True:
+            t0 = time.perf_counter()
 
-            # 4. Adım: Önce Tesseract, gerekirse RapidOCR kullan
-            sonuclar = None
-            if tesseract_yolu:
-                tesseract_baslangici = time.perf_counter()
-                tesseract_metin = pytesseract.image_to_string(
-                    ham_gorsel,
-                    lang="eng",
-                    config="--psm 7",
-                ).strip()
-                tesseract_suresi = (time.perf_counter() - tesseract_baslangici) * 1000
-                if tesseract_metin:
-                    temiz_metin = " ".join(tesseract_metin.split())
-                else:
-                    temiz_metin = ""
-            else:
-                temiz_metin = ""
-                tesseract_suresi = 0.0
+            ham = np.asarray(sct.grab(bolge))  # RAM'den, dosya yok (BGRA)
+            t1 = time.perf_counter()
 
-            if not temiz_metin:
-                rapid_baslangici = time.perf_counter()
-                sonuclar, _ = ocr_motoru(ham_gorsel)
-                rapid_suresi = (time.perf_counter() - rapid_baslangici) * 1000
-                if sonuclar:
-                    temiz_metin = " ".join(
-                        satir[1].strip() for satir in sonuclar
-                    ).strip()
-            else:
-                rapid_suresi = 0.0
+            maske = yazi_maskesi(ham)
+            if okunan is None:  # ilk kare: boş ekranla kıyasla
+                okunan = np.zeros_like(maske)
+                onceki = maske
+            fark_okunan = cv2.countNonZero(cv2.bitwise_xor(maske, okunan))
+            fark_onceki = cv2.countNonZero(cv2.bitwise_xor(maske, onceki))
+            onceki = maske
+            t2 = time.perf_counter()
 
-    except PermissionError:
-        print("[UYARI] Dosya şu an C# tarafından yazılıyor, okuma atlandı.")
-        return
-    except Exception as hata:
-        print(f"[HATA] Görsel okunurken bir sorun oluştu: {hata}")
-        return
+            if fark_okunan > DEGISIM_ESIGI:
+                if ilk_degisim is None:
+                    ilk_degisim = t0
 
-    # 5. Adım: Çıktıyı Temizlemek ve Çok Satırlı Altyazıları Birleştirmek
-    if not temiz_metin:
-        print("[SONUÇ] Ekranda altyazı algılanmadı.")
-        return
+                oturdu = fark_onceki <= DEGISIM_ESIGI
+                zaman_asimi = (t0 - ilk_degisim) > EN_FAZLA_BEKLEME
 
-    # 6. Adım: Konsola Yazdırmak ve Süreyi Gözlemlemek
-    if temiz_metin:
-        print("-" * 40)
-        print(f"Okunan Metin : {temiz_metin}")
-        print("-" * 40)
-        toplam_sure = (time.perf_counter() - baslangic_zamani) * 1000
-        print(f"Görüntü yükleme süresi : {goruntu_yukleme_suresi:.1f} ms")
-        if tesseract_yolu:
-            print(f"Tesseract süresi       : {tesseract_suresi:.1f} ms")
-        if rapid_suresi > 0:
-            print(f"RapidOCR yedek süresi   : {rapid_suresi:.1f} ms")
-        print(f"Toplam işlem süresi     : {toplam_sure:.1f} ms")
-    else:
-        print("[SONUÇ] Altyazı algılanmadı (Boş çıktı).")
+                if oturdu or zaman_asimi:
+                    if cv2.countNonZero(maske) < MIN_YAZI_PIKSELI:
+                        metin, t_tes, t_rap = "", 0.0, 0.0  # bölge boş, OCR çalıştırma
+                    else:
+                        metin, t_tes, t_rap = ocr_yap(
+                            ocr_icin_hazirla(maske), tesseract_var, rapid
+                        )
+                    t3 = time.perf_counter()
+                    okunan = maske
+
+                    if metin != son_metin:
+                        son_metin = metin
+                        print("-" * 40)
+                        print(f"Okunan Metin : {metin or '[altyazı yok]'}")
+                        print("-" * 40)
+                        print(f"Yakalama      : {(t1 - t0) * 1000:.1f} ms")
+                        print(f"Maske + fark  : {(t2 - t1) * 1000:.1f} ms")
+                        if tesseract_var:
+                            print(f"Tesseract     : {t_tes:.1f} ms")
+                        if t_rap > 0:
+                            print(f"RapidOCR      : {t_rap:.1f} ms")
+                        print(f"Değişimi görmekten metne: {(t3 - ilk_degisim) * 1000:.1f} ms")
+
+                    ilk_degisim = None
+
+            kalan = POLL_ARALIGI - (time.perf_counter() - t0)
+            if kalan > 0:
+                time.sleep(kalan)
+
+    except KeyboardInterrupt:
+        print("\n[BİLGİ] Durduruldu.")
+    finally:
+        sct.close()
+
 
 if __name__ == "__main__":
-    altyazi_oku()
+    main()
